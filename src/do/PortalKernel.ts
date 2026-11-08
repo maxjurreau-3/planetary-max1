@@ -1,297 +1,261 @@
-import { KernelEnvelope, KernelResult, resolveUmbrellaMode, UmbrellaMode, createEnvelope, failureResponse, readKernelResult, resultResponse } from '../kernel-bridge';
+// ==========================================================
+// PHASE 13.0 — COMPLETE PORTALKERNEL RUNTIME
+// Umbrella kernel runtime with sim core, identity flow, and result enrichment
+// ==========================================================
 
-type UniverseState = {
-  tick: number;
-  properties: Record<string, unknown>;
-  lastOperation: null | { messageId: string; type: string };
-};
+import type {
+  JsonObject,
+  KernelEnvelope,
+  KernelResult,
+} from '../contracts';
 
-type PortalKernelEnv = {
-  UMBRELLA_ENFORCEMENT?: string;
-};
+import {
+  failureResponse,
+  resultResponse,
+  resolveUmbrellaMode,
+} from '../kernel-bridge';
+
+import { KernelEngine, type LaneExecutionContext } from '../kernel-engine';
+import { initializeSimCore, stepSimCore } from '../sim-core';
+import { computeIdentityCurvature, updateIdentityState } from '../identity-engine';
+import { resolveUmbrellaField, resolveUmbrellaPath, isLaneAdmitted } from '../umbrella-field';
+import { computeCollapseVector } from '../collapse-vector';
+import { indexPattern } from '../pattern-index';
+import { emitTelemetry } from '../telemetry';
+import { generateDailyBrief } from '../daily-brief';
 
 export class PortalKernel {
-  private state: DurableObjectState;
-  private env: PortalKernelEnv;
-  private universeState: UniverseState | null = null;
-
-  constructor(state: DurableObjectState, env: PortalKernelEnv) {
-    this.state = state;
-    this.env = env;
-  }
+  private engine: KernelEngine | null = null;
+  private simCoreState: JsonObject | null = null;
+  private identityState: JsonObject | null = null;
+  private resultHistory: Array<{ ok: boolean; processingTime?: number }> = [];
 
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/health') {
-      return Response.json({ status: 'ok', service: 'portal-kernel' });
-    }
-
-    if (url.pathname === '/api/kernel/message' && request.method === 'POST') {
-      return this.handleKernelMessage(request);
-    }
-
-    return failureResponse('NOT_FOUND', 'Route not found', 404);
-  }
-
-  private async handleKernelMessage(request: Request): Promise<Response> {
-    let envelope: KernelEnvelope;
-
     try {
-      envelope = await request.json();
-    } catch {
-      return failureResponse('INVALID_JSON', 'Request body must be valid JSON', 400);
-    }
+      const envelope = await this.parseEnvelope(request);
 
-    if (!this.isValidEnvelope(envelope)) {
-      return failureResponse('INVALID_MESSAGE', 'Envelope must include id, type, payload, identity, and governanceContext', 400);
-    }
-
-    const mode = resolveUmbrellaMode(
-      typeof envelope.governanceContext.umbrellaMode === 'string'
-        ? (envelope.governanceContext.umbrellaMode as string)
-        : this.env.UMBRELLA_ENFORCEMENT
-    );
-
-    // Check governance denials
-    if (envelope.governanceContext.deny === true && mode === 'strict') {
-      return failureResponse('FORBIDDEN', 'Operation denied by governance', 403);
-    }
-
-    // Handle specific operation types
-    if (envelope.type === 'universe.state') {
-      return this.handleUniverseState(envelope, mode);
-    }
-
-    if (envelope.type === 'universe.tick') {
-      return this.handleUniverseTick(envelope, mode);
-    }
-
-    if (envelope.type === 'umbrella.os') {
-      return this.handleUmbrellaOS(envelope, mode);
-    }
-
-    // Check lane access policy
-    const allowedLanes = envelope.governanceContext.allowedLanes as string[] | undefined;
-    if (allowedLanes && !this.isLaneAllowed(envelope.type, allowedLanes)) {
-      return failureResponse('FORBIDDEN', 'Lane access denied', 403);
-    }
-
-    // Default operation handler
-    const result: KernelResult = {
-      ok: true,
-      data: {
-        kernel: 'Portal-OS Kernel Engine',
-        operation: envelope.type,
-        accepted: true,
-      },
-      lanes: [
-        {
-          name: 'kernel',
-          result: {
-            results: [
-              {
-                result: {
-                  data: {
-                    kernel: 'Portal-OS Kernel Engine',
-                    operation: envelope.type,
-                    accepted: true,
-                  },
-                  meta: { source: 'PortalKernel', governance: mode },
-                },
-              },
-            ],
-          },
-        },
-      ],
-      meta: {
-        messageId: envelope.id,
-        type: envelope.type,
-        umbrella: `umbrella.${envelope.type}`,
-        identity: { propagated: true },
-        governance: {
-          mode,
-          decision: mode === 'off' ? 'bypassed' : mode === 'advisory' ? 'advisory' : 'allowed',
-          deltas: [],
-        },
-      },
-    };
-
-    return resultResponse(result, 200);
-  }
-
-  private async handleUniverseState(envelope: KernelEnvelope, mode: UmbrellaMode): Promise<Response> {
-    const state = await this.getUniverseState();
-
-    const result: KernelResult = {
-      ok: true,
-      data: state,
-      lanes: [
-        {
-          name: 'universe',
-          result: {
-            results: [
-              {
-                result: {
-                  data: state,
-                  meta: { source: 'PortalKernel', governance: mode },
-                },
-              },
-            ],
-          },
-        },
-      ],
-      meta: {
-        messageId: envelope.id,
-        type: envelope.type,
-        umbrella: 'universe-state',
-        identity: { propagated: true },
-        governance: {
-          mode,
-          decision: mode === 'off' ? 'bypassed' : mode === 'advisory' ? 'advisory' : 'allowed',
-          deltas: [],
-        },
-      },
-    };
-
-    return resultResponse(result, 200);
-  }
-
-  private async handleUniverseTick(envelope: KernelEnvelope, mode: UmbrellaMode): Promise<Response> {
-    const state = await this.getUniverseState();
-
-    // Apply changes deterministically
-    const changes = envelope.payload.changes as Record<string, unknown> | undefined;
-    if (changes && typeof changes === 'object') {
-      const sorted = Object.keys(changes).sort();
-      for (const key of sorted) {
-        const value = changes[key];
-        if (typeof value === 'number') {
-          const current = typeof state.properties[key] === 'number' ? (state.properties[key] as number) : 0;
-          state.properties[key] = current + value;
-        }
+      if (!envelope) {
+        return failureResponse('INVALID_REQUEST', 'Request body is not a valid KernelEnvelope', 400);
       }
-    }
 
-    state.tick++;
-    state.lastOperation = { messageId: envelope.id, type: envelope.type };
+      if (!this.engine || !this.simCoreState || !this.identityState) {
+        this.initializeKernel(envelope);
+      }
 
-    await this.state.storage?.put('universe', state);
+      if (!this.engine || !this.simCoreState || !this.identityState) {
+        return failureResponse('KERNEL_INIT_FAILED', 'Kernel initialization failed', 500);
+      }
 
-    const result: KernelResult = {
-      ok: true,
-      data: state,
-      lanes: [
+      const umbrellaField = resolveUmbrellaField({
+        governanceContext: envelope.governanceContext,
+        umbrellaMode: envelope.umbrellaEnforcement ?? 'strict',
+        identity: envelope.identity,
+      });
+
+      const umbrellaPath = resolveUmbrellaPath({
+        laneRouting: envelope.laneRouting ?? {
+          lane: envelope.type,
+          route: [envelope.type],
+        },
+        governanceContext: envelope.governanceContext,
+        umbrellaMode: envelope.umbrellaEnforcement ?? 'strict',
+      });
+
+      const selectedLane = envelope.laneRouting?.lane ?? envelope.type;
+      if (!isLaneAdmitted(umbrellaField, selectedLane)) {
+        const failure: KernelResult = {
+          ok: false,
+          messageId: envelope.id,
+          type: envelope.type,
+          identity: envelope.identity,
+          meta: {
+            umbrellaField,
+            umbrellaPath,
+            governance: { mode: umbrellaField.mode, decision: 'denied' },
+          },
+          error: {
+            code: 'LANE_DENIED',
+            message: 'Lane not admitted under the current umbrella field',
+          },
+        };
+        emitTelemetry(failure as JsonObject);
+        return resultResponse(failure, 403);
+      }
+
+      // Advance simulation state and identity
+      this.simCoreState = stepSimCore(this.simCoreState as any, envelope.payload);
+      const nextCurvature = computeIdentityCurvature(this.identityState, this.simCoreState);
+      this.identityState = updateIdentityState(
         {
-          name: 'universe',
-          result: {
-            results: [
-              {
-                result: {
-                  data: state,
-                  meta: { source: 'PortalKernel', governance: mode },
-                },
-              },
-            ],
+          ...(this.identityState ?? { subject: envelope.identity, curvature: nextCurvature }),
+          subject: envelope.identity,
+          curvature: nextCurvature,
+        },
+        [envelope.payload],
+      ) as JsonObject;
+
+      const actionContext: LaneExecutionContext = {
+        identity: envelope.identity,
+        governanceContext: envelope.governanceContext,
+        planetaryMode: envelope.planetaryMode ?? 'single',
+        umbrellaEnforcement: envelope.umbrellaEnforcement ?? 'strict',
+        umbrellaMode: resolveUmbrellaMode(envelope.umbrellaEnforcement),
+        identityCurvature: nextCurvature,
+        entropyTick: Number((this.simCoreState as any).tick ?? 0),
+        storage: this.createStorage(),
+        env: {},
+      };
+
+      const kernelResult = await this.engine.dispatch(envelope);
+      const collapseVector = computeCollapseVector(this.simCoreState, this.identityState);
+      const patternIndex = indexPattern(envelope.payload, {
+        type: envelope.type,
+        identity: envelope.identity,
+        planetaryMode: actionContext.planetaryMode,
+        umbrellaMode: actionContext.umbrellaMode,
+        lane: selectedLane,
+      });
+
+      const enrichedResult: KernelResult = {
+        ...kernelResult,
+        meta: {
+          ...(kernelResult.meta ?? {}),
+          identity: {
+            state: this.identityState,
+            curvature: nextCurvature,
+            propagated: true,
+          },
+          planetaryMode: actionContext.planetaryMode,
+          umbrellaEnforcement: actionContext.umbrellaEnforcement,
+          umbrellaField,
+          umbrellaPath,
+          identityCurvature: nextCurvature,
+          entropyTick: actionContext.entropyTick,
+          simCore: this.simCoreState,
+          collapseVector,
+          patternIndex,
+          governance: {
+            mode: actionContext.umbrellaMode,
+            decision: kernelResult.ok ? 'allowed' : 'denied',
+            deltas: [],
           },
         },
-      ],
-      meta: {
-        messageId: envelope.id,
-        type: envelope.type,
-        umbrella: 'universe-tick',
-        identity: { propagated: true },
-        governance: {
-          mode,
-          decision: mode === 'off' ? 'bypassed' : mode === 'advisory' ? 'advisory' : 'allowed',
-          deltas: [],
+      };
+
+      this.resultHistory.push({
+        ok: kernelResult.ok,
+        processingTime: 0,
+      });
+
+      const brief = generateDailyBrief({
+        startTime: Date.now() - 86400000,
+        endTime: Date.now(),
+        results: this.resultHistory,
+        identity: envelope.identity,
+        currentCurvature: nextCurvature,
+        currentEntropy: Number((this.simCoreState as any).entropy ?? 0),
+        governanceContext: envelope.governanceContext,
+      });
+
+      emitTelemetry(enrichedResult as JsonObject);
+      if ('meta' in enrichedResult && enrichedResult.meta && typeof enrichedResult.meta === 'object') {
+        (enrichedResult.meta as JsonObject).dailyBrief = brief;
+      }
+
+      return resultResponse(enrichedResult, kernelResult.ok ? 200 : 400);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Kernel execution failed';
+      const failure: KernelResult = {
+        ok: false,
+        messageId: 'portal-kernel-error',
+        error: {
+          code: 'PORTAL_KERNEL_ERROR',
+          message,
         },
-      },
-    };
-
-    return resultResponse(result, 200);
-  }
-
-  private async handleUmbrellaOS(envelope: KernelEnvelope, mode: UmbrellaMode): Promise<Response> {
-    const permissions = envelope.payload.permissions as Record<string, unknown> | undefined;
-
-    const result: KernelResult = {
-      ok: true,
-      data: {
-        osPermissions: permissions ?? {},
-        osIdentity: {},
-        osGovernanceFlags: {},
-        osTruthInvariants: { structuralTruth: true },
-      },
-      lanes: [
-        {
-          name: 'umbrella.os',
-          result: {
-            results: [
-              {
-                result: {
-                  data: {
-                    osPermissions: permissions ?? {},
-                    osIdentity: {},
-                    osGovernanceFlags: {},
-                    osTruthInvariants: { structuralTruth: true },
-                  },
-                  meta: { source: 'PortalKernel', governance: mode },
-                },
-              },
-            ],
-          },
-        },
-      ],
-      meta: {
-        messageId: envelope.id,
-        type: envelope.type,
-        umbrella: 'os-update',
-        identity: { propagated: true },
-        governance: {
-          mode,
-          decision: mode === 'off' ? 'bypassed' : mode === 'advisory' ? 'advisory' : 'allowed',
-          deltas: [],
-        },
-      },
-    };
-
-    return resultResponse(result, 200);
-  }
-
-  private async getUniverseState(): Promise<UniverseState> {
-    const stored = await this.state.storage?.get<UniverseState>('universe');
-    if (stored) {
-      this.universeState = stored;
-      return stored;
+      };
+      emitTelemetry(failure as JsonObject);
+      return failureResponse('PORTAL_KERNEL_ERROR', message, 500);
     }
-
-    this.universeState = {
-      tick: 0,
-      properties: {},
-      lastOperation: null,
-    };
-
-    return this.universeState;
   }
 
-  private isValidEnvelope(value: unknown): value is KernelEnvelope {
-    if (!this.isRecord(value)) return false;
-    return (
-      typeof value.id === 'string' &&
-      typeof value.type === 'string' &&
-      this.isRecord(value.payload) &&
-      typeof value.identity === 'string' &&
-      this.isRecord(value.governanceContext)
-    );
+  private initializeKernel(envelope: KernelEnvelope): void {
+    this.simCoreState = initializeSimCore({
+      identity: envelope.identity,
+      governanceContext: envelope.governanceContext,
+      planetaryMode: envelope.planetaryMode ?? 'single',
+      umbrellaMode: envelope.umbrellaEnforcement ?? 'strict',
+    });
+
+    this.identityState = updateIdentityState(
+      {
+        subject: envelope.identity,
+        curvature: 50,
+      },
+      [],
+    ) as JsonObject;
+
+    this.engine = new KernelEngine({
+      identity: envelope.identity,
+      governanceContext: envelope.governanceContext,
+      planetaryMode: envelope.planetaryMode ?? 'single',
+      umbrellaEnforcement: envelope.umbrellaEnforcement ?? 'strict',
+      umbrellaMode: resolveUmbrellaMode(envelope.umbrellaEnforcement),
+      identityCurvature: 50,
+      entropyTick: 0,
+      storage: this.createStorage(),
+      env: {},
+    });
   }
 
-  private isLaneAllowed(type: string, allowedLanes: string[]): boolean {
-    const lane = type.includes('.') ? type.substring(0, type.lastIndexOf('.')) : type;
-    return allowedLanes.includes(lane);
+  private async parseEnvelope(request: Request): Promise<KernelEnvelope | null> {
+    try {
+      const body = await request.json();
+      if (
+        body &&
+        typeof body === 'object' &&
+        'id' in body &&
+        'type' in body &&
+        'payload' in body &&
+        'identity' in body
+      ) {
+        return body as KernelEnvelope;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
-  private isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  private createStorage(): DurableObjectStorage {
+    const store = new Map<string, unknown>();
+    return {
+      async get<T>(key: string): Promise<T | undefined> {
+        return (store.get(key) as T | undefined) ?? undefined;
+      },
+      async put(key: string, value: unknown): Promise<void> {
+        store.set(key, value);
+      },
+      async delete(key: string): Promise<void> {
+        store.delete(key);
+      },
+      async deleteAll(): Promise<void> {
+        store.clear();
+      },
+      async list(): Promise<Map<string, unknown>> {
+        return new Map(store);
+      },
+      async getAlarm(): Promise<number | null> {
+        return null;
+      },
+      async setAlarm(scheduledTimeMs: number): Promise<void> {
+        void scheduledTimeMs;
+      },
+      async deleteAlarm(): Promise<void> {
+        // noop
+      },
+      async sync(): Promise<void> {
+        // noop
+      },
+    } as unknown as DurableObjectStorage;
   }
 }

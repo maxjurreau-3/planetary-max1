@@ -7,7 +7,6 @@
 
 import { Context, Hono } from 'hono';
 import {
-  Bindings,
   authenticatedIdentity,
   callKernel,
   createEnvelope,
@@ -15,6 +14,12 @@ import {
   readKernelResult,
   resultResponse,
 } from './kernel-bridge';
+import type {
+  Bindings,
+  KernelResult,
+  JsonObject,
+  JsonValue,
+} from './contracts';
 
 export type IntrospectionKind =
   | 'sim.behavior'
@@ -81,17 +86,46 @@ async function handleIntrospection(
     const result = await readKernelResult(response, envelope, 'PortalKernel');
     if (!result.ok) return resultResponse(result, response.status);
 
+    // Safely narrow governance.mode with proper type guards
+    const governanceMode: 'strict' | 'advisory' | 'off' = (() => {
+      if (!result.meta || typeof result.meta !== 'object' || Array.isArray(result.meta)) {
+        return 'strict';
+      }
+      const gov = (result.meta as JsonObject).governance;
+      if (!gov || typeof gov !== 'object' || Array.isArray(gov)) {
+        return 'strict';
+      }
+      const mode = (gov as JsonObject).mode;
+      if (mode === 'strict' || mode === 'advisory' || mode === 'off') {
+        return mode as 'strict' | 'advisory' | 'off';
+      }
+      return 'strict';
+    })();
+
+    // Safely narrow identity.propagated with proper type guards
+    const identityPropagated: boolean = (() => {
+      if (!result.meta || typeof result.meta !== 'object' || Array.isArray(result.meta)) {
+        return false;
+      }
+      const id = (result.meta as JsonObject).identity;
+      if (!id || typeof id !== 'object' || Array.isArray(id)) {
+        return false;
+      }
+      const propagated = (id as JsonObject).propagated;
+      return Boolean(propagated);
+    })();
+
     const payload: IntrospectionResponse = {
       ok: true,
-      data: result.data,
+      data: (result.data ?? {}) as Record<string, unknown>,
       meta: {
         kind,
         source: 'kernel',
         timestamp: Date.now(),
-        governance: result.meta.governance.mode,
+        governance: governanceMode,
         identity: {
           subject: extractSubject(identity),
-          propagated: result.meta.identity.propagated,
+          propagated: identityPropagated,
         },
       },
     };

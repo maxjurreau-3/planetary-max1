@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import type { KernelEnvelope } from './contracts';
+import type { KernelEnvelope, JsonObject, JsonValue } from './contracts';
 import { KernelEngine, type LaneExecutionContext } from './kernel-engine';
 
-function envelope(type: string, payload: Record<string, unknown> = {}): KernelEnvelope {
+function envelope(type: string, payload: JsonObject = {}): KernelEnvelope {
   return {
     id: `message-${type}`,
     type,
@@ -13,12 +13,12 @@ function envelope(type: string, payload: Record<string, unknown> = {}): KernelEn
   };
 }
 
-function engine(governanceContext: Record<string, unknown> = {}): KernelEngine {
-  const values = new Map<string, unknown>();
+function engine(governanceContext: JsonObject = {}): KernelEngine {
+  const values = new Map<string, JsonValue>();
   const storage = {
     get: async <T>(key: string): Promise<T | undefined> => values.get(key) as T | undefined,
     put: async (key: string, value: unknown): Promise<void> => {
-      values.set(key, structuredClone(value));
+      values.set(key, structuredClone(value) as JsonValue);
     },
   } as unknown as DurableObjectStorage;
   const context: LaneExecutionContext = {
@@ -26,7 +26,11 @@ function engine(governanceContext: Record<string, unknown> = {}): KernelEngine {
     governanceContext,
     planetaryMode: 'single',
     umbrellaEnforcement: 'strict',
+    umbrellaMode: 'strict',
+    identityCurvature: 1,
+    entropyTick: 0,
     storage,
+    env: {},
   };
   return new KernelEngine(context);
 }
@@ -82,7 +86,7 @@ describe('KernelEngine', () => {
   });
 
   it('enforces governance denial before any lane executes', async () => {
-    const result = await engine({ deny: true }).dispatch(envelope('universe.tick'));
+    const result = await engine({ deny: true } as JsonObject).dispatch(envelope('universe.tick'));
 
     expect(result).toEqual({
       ok: false,

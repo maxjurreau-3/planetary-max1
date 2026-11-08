@@ -5,6 +5,7 @@
   "scripts": {
     "build": "tsc",
     "check": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
@@ -14,7 +15,7 @@
     "@cloudflare/workers-types": "latest",
     "esbuild": "^0.23.1",
     "typescript": "^5.9.3",
-    "vitest": "^2.1.9",
+    "vitest": "^3.2.4",
     "wrangler": "^4.131.2"
   }
 }

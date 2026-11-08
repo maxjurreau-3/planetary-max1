@@ -1,4 +1,5 @@
-import type { KernelEnvelope, KernelLaneResult, KernelResult } from './contracts';
+import type { JsonValue, KernelEnvelope, KernelLaneResult, KernelResult } from './contracts';
+import { resolveUmbrellaMode, type UmbrellaMode } from './kernel-bridge';
 
 type UniverseState = {
   started: boolean;
@@ -6,12 +7,19 @@ type UniverseState = {
   ecosystem: Record<string, unknown>;
 };
 
+/**
+ * Phase-12 lane execution context with governance and umbrella support
+ */
 export type LaneExecutionContext = {
   identity: string;
   governanceContext: Record<string, unknown>;
   planetaryMode: string;
   umbrellaEnforcement: string;
+  umbrellaMode: UmbrellaMode;
+  identityCurvature: number;
+  entropyTick: number;
   storage: DurableObjectStorage;
+  env: Record<string, unknown>;
 };
 
 export type LaneHandler = (
@@ -67,7 +75,9 @@ export class KernelEngine {
   async dispatch(envelope: KernelEnvelope): Promise<KernelResult> {
     const route = this.routes.get(envelope.type);
     if (!route) return kernelError(envelope, 'INVALID_MESSAGE', `Unsupported message type: ${envelope.type}`);
-    if (this.context.governanceContext.deny === true) {
+    
+    // Check governance denials with umbrella mode awareness
+    if (this.context.governanceContext.deny === true && this.context.umbrellaMode === 'strict') {
       return kernelError(envelope, 'FORBIDDEN', 'Governance context denied this operation');
     }
 
@@ -86,6 +96,13 @@ export class KernelEngine {
         identity: envelope.identity,
         route,
         result: { lanes },
+        meta: {
+          governance: {
+            mode: this.context.umbrellaMode,
+            decision: this.context.umbrellaMode === 'off' ? 'bypassed' : this.context.umbrellaMode === 'advisory' ? 'advisory' : 'allowed',
+            deltas: [],
+          },
+        },
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Kernel lane failed';
@@ -98,7 +115,7 @@ function aggregateLaneResult(lane: string, data: unknown): KernelLaneResult {
   return {
     lane,
     result: {
-      results: [{ result: { data } }],
+      results: [{ result: { data: data as JsonValue } }],
     },
   };
 }
@@ -130,6 +147,7 @@ function governanceLane(
     identity: context.identity,
     enforcement: context.umbrellaEnforcement,
     mode: context.planetaryMode,
+    umbrellaMode: context.umbrellaMode,
   };
 }
 
@@ -153,6 +171,7 @@ async function universeStateLane(
   return {
     operation: envelope.type,
     mode: context.planetaryMode,
+    umbrellaMode: context.umbrellaMode,
     ...current,
   };
 }
@@ -168,6 +187,7 @@ function umbrellaAdvisoryLane(
     identity: context.identity,
     enforcement: context.umbrellaEnforcement,
     mode: context.planetaryMode,
+    umbrellaMode: context.umbrellaMode,
     governanceContext: context.governanceContext,
   };
 }
